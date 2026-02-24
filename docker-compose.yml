@@ -1,0 +1,180 @@
+# ============================================
+# Flowable Insight - Umbrella Docker Compose
+# ============================================
+# 統一編排所有服務 (Data Pipeline + Frontend + Backend)
+# 所有 Image 皆來自公司內部的 Harbor Registry
+#
+# Target VM 解壓後的目錄結構:
+#   /opt/flowable-insight/
+#   ├── .env
+#   ├── docker-compose.yml       <- 本檔案
+#   ├── flowable-ctl.sh
+#   ├── config/cube/
+#   ├── data/{clickhouse,cubestore}
+#   └── backup/
+# ============================================
+
+services:
+
+  # =============================================
+  #  📊 Data Pipeline Services (flowable-insight-etl)
+  # =============================================
+
+  # --- ClickHouse (Data Storage & ODBC Sync) ---
+  clickhouse-server:
+    image: ${HARBOR_HOST}/${HARBOR_PROJECT}/flowable-clickhouse-odbc:${CLICKHOUSE_TAG:-latest}
+    container_name: flowable_clickhouse
+    hostname: clickhouse-server
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-flowable_analytics}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./data/clickhouse:/var/lib/clickhouse
+    deploy:
+      resources:
+        limits:
+          memory: 22G
+        reservations:
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+  # --- Cube Store (Caching Layer) ---
+  cubestore:
+    image: cubejs/cubestore:v1.5.1
+    container_name: flowable_cubestore
+    environment:
+      CUBESTORE_WORKERS: 1
+    volumes:
+      - ./data/cubestore:/cube/data
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 2G
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+  # --- Cube.js API (Semantic Layer) ---
+  cube:
+    image: cubejs/cube:v1.5.1
+    container_name: flowable_cube
+    ports:
+      - "4000:4000"
+    environment:
+      CUBEJS_DB_TYPE: clickhouse
+      CUBEJS_DB_HOST: clickhouse-server
+      CUBEJS_DB_PORT: 8123
+      CUBEJS_DB_NAME: ${CLICKHOUSE_DB:-flowable_analytics}
+      CUBEJS_DB_USER: ${CLICKHOUSE_USER:-default}
+      CUBEJS_DB_PASS: ${CLICKHOUSE_PASSWORD}
+      CUBEJS_API_SECRET: ${CUBEJS_API_SECRET}
+      CUBEJS_DEV_MODE: "false"
+      CUBEJS_CUBESTORE_HOST: cubestore
+      CUBEJS_CUBESTORE_PORT: 3030
+      CUBEJS_CACHE_AND_QUEUE_DRIVER: cubestore
+      CUBEJS_CONCURRENCY: 4
+      CUBEJS_DB_MAX_POOL: 8
+      CUBEJS_DB_QUERY_TIMEOUT: 600
+      CUBEJS_LOG_LEVEL: info
+    volumes:
+      - ./config/cube:/cube/conf
+    depends_on:
+      clickhouse-server:
+        condition: service_healthy
+      cubestore:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+  # --- BFF API Gateway (Node.js) ---
+  bff-service:
+    image: ${HARBOR_HOST}/${HARBOR_PROJECT}/flowable-bff:${BFF_TAG:-latest}
+    container_name: flowable_bff
+    environment:
+      PORT: 8050
+      CUBEJS_API_URL: http://cube:4000/cubejs-api/v1
+      CUBEJS_API_SECRET: ${CUBEJS_API_SECRET}
+    ports:
+      - "8050:8050"
+    depends_on:
+      cube:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8050/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+  # =============================================
+  #  🌐 Application Services (Other Repos)
+  # =============================================
+
+  # --- Frontend (React.js) ---
+  frontend:
+    image: ${HARBOR_HOST}/${HARBOR_PROJECT}/flowable-frontend:${FRONTEND_TAG:-latest}
+    container_name: flowable_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - bff-service
+      - backend
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+  # --- Backend (Java + LDAP) ---
+  backend:
+    image: ${HARBOR_HOST}/${HARBOR_PROJECT}/flowable-backend:${BACKEND_TAG:-latest}
+    container_name: flowable_backend
+    ports:
+      - "8080:8080"
+    environment:
+      # LDAP / AD 連線 (由 Java 後端使用)
+      LDAP_HOST: ${LDAP_HOST:-ldap.company.local}
+      LDAP_PORT: ${LDAP_PORT:-389}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-dc=company,dc=local}
+      # 資料庫 (如果 Backend 需要自己的 DB，請在此設定)
+      # DB_HOST: ...
+    restart: unless-stopped
+    networks:
+      - flowable-network
+
+networks:
+  flowable-network:
+    driver: bridge

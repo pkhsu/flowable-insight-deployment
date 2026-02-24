@@ -1,0 +1,18 @@
+[Unit]
+Description=Flowable Insight Daily Backup to S3
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/flowable-insight/deploy/ubuntu-vm/backup
+ExecStart=/opt/flowable-insight/deploy/ubuntu-vm/backup/backup-to-s3.sh full
+StandardOutput=journal
+StandardError=journal
+
+# 超時設定 (最多執行 2 小時)
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target
